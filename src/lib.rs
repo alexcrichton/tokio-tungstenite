@@ -32,8 +32,10 @@ mod connect;
 pub mod stream;
 
 use std::io::ErrorKind;
+use std::mem;
 
 use futures::{Poll, Future, Async, AsyncSink, Stream, Sink, StartSend};
+use futures::task::{self, Task};
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use url::Url;
@@ -41,7 +43,7 @@ use url::Url;
 use tungstenite::handshake::client::ClientHandshake;
 use tungstenite::handshake::server::ServerHandshake;
 use tungstenite::handshake::{HandshakeRole, HandshakeError};
-use tungstenite::protocol::{WebSocket, Message};
+use tungstenite::protocol::{WebSocket, Message, CtlMessageHandler};
 use tungstenite::error::Error as WsError;
 use tungstenite::server;
 
@@ -134,6 +136,48 @@ pub fn accept_async<S: AsyncRead + AsyncWrite>(stream: S) -> AcceptAsync<S> {
 /// and unit tests for this crate.
 pub struct WebSocketStream<S> {
     inner: WebSocket<S>,
+    ctl: CtlState,
+}
+
+enum CtlState {
+    None,
+    Pong(Vec<u8>),
+    Waiting(Task),
+}
+
+impl<T> WebSocketStream<T> where T: AsyncRead + AsyncWrite {
+    fn new(t: WebSocket<T>) -> WebSocketStream<T> {
+        WebSocketStream {
+            inner: t,
+            ctl: CtlState::None,
+        }
+    }
+
+    /// Queues up a ping to be sent on this socket
+    pub fn send_ping(&mut self, ping: Vec<u8>) -> Result<(), WsError> {
+        self.inner.send_ping(ping)
+    }
+
+    /// dox
+    pub fn poll_pong(&mut self) -> Async<Vec<u8>> {
+        match mem::replace(&mut self.ctl, CtlState::None) {
+            CtlState::None |
+            CtlState::Waiting(_) => {}
+            CtlState::Pong(data) => return Async::Ready(data),
+        }
+        self.ctl = CtlState::Waiting(task::current());
+        Async::NotReady
+    }
+}
+
+impl CtlMessageHandler for CtlState {
+    fn pong(&mut self, data: Vec<u8>) {
+        match mem::replace(self, CtlState::Pong(data)) {
+            CtlState::None |
+            CtlState::Pong(_) => {}
+            CtlState::Waiting(task) => task.notify(),
+        }
+    }
 }
 
 impl<T> Stream for WebSocketStream<T> where T: AsyncRead + AsyncWrite {
@@ -141,7 +185,7 @@ impl<T> Stream for WebSocketStream<T> where T: AsyncRead + AsyncWrite {
     type Error = WsError;
 
     fn poll(&mut self) -> Poll<Option<Message>, WsError> {
-        self.inner.read_message().map(|m| Some(m)).to_async()
+        self.inner.read_message(&mut self.ctl).map(|m| Some(m)).to_async()
     }
 }
 
@@ -199,11 +243,11 @@ impl<S: AsyncRead + AsyncWrite, R: HandshakeRole> Future for MidHandshake<S, R> 
 
     fn poll(&mut self) -> Poll<WebSocketStream<S>, WsError> {
         match self.inner.take().expect("cannot poll MidHandshake twice") {
-            Ok(stream) => Ok(WebSocketStream { inner: stream }.into()),
+            Ok(stream) => Ok(WebSocketStream::new(stream).into()),
             Err(HandshakeError::Failure(e)) => Err(e),
             Err(HandshakeError::Interrupted(s)) => {
                 match s.handshake() {
-                    Ok(stream) => Ok(WebSocketStream { inner: stream }.into()),
+                    Ok(stream) => Ok(WebSocketStream::new(stream).into()),
                     Err(HandshakeError::Failure(e)) => Err(e),
                     Err(HandshakeError::Interrupted(s)) => {
                         self.inner = Some(Err(HandshakeError::Interrupted(s)));
